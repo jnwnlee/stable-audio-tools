@@ -236,6 +236,32 @@ class SampleDataset(torch.utils.data.Dataset):
 
             info["load_time"] = end_time - start_time
 
+            
+            # ==========================================
+            # [HARDCODED INJECTION] 강제로 JSON 읽기
+            # ==========================================
+            import json
+            import os
+            json_path = os.path.splitext(audio_filename)[0] + ".json"
+            
+            info["prompt"] = "A music song."
+            info["text"] = "A music song."
+            info["reward_score"] = 0.0
+            
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path, "r") as jf:
+                        j_data = json.load(jf)
+                        txt = j_data.get("prompt", j_data.get("text", "A music song."))
+                        info["prompt"] = txt
+                        info["text"] = txt
+                        info["reward_score"] = float(j_data.get("reward_score", 0.0))
+                except Exception as e:
+                    print(f"[!] JSON parsing error for {json_path}: {e}")
+            else:
+                pass # JSON 파일이 없어도 에러 대신 기본값으로 넘어감
+
+            # 기존 custom metadata 로직 유지
             for custom_md_path in self.custom_metadata_fns.keys():
                 if custom_md_path in audio_filename:
                     custom_metadata_fn = self.custom_metadata_fns[custom_md_path]
@@ -245,10 +271,8 @@ class SampleDataset(torch.utils.data.Dataset):
                 if "__reject__" in info and info["__reject__"]:
                     return self[random.randrange(len(self))]
 
-                # Provide audio inputs as their own dictionary to be merged into info, each audio element will be normalized in the same way as the main audio
                 if "__audio__" in info:
                     for audio_key, audio_value in info["__audio__"].items():
-                        # Process the audio_value tensor, which should be a torch tensor
                         audio_value, _, _, _, _, _ = self.pad_crop(audio_value)
                         audio_value = audio_value.clamp(-1, 1)
                         if self.encoding is not None:
@@ -256,6 +280,8 @@ class SampleDataset(torch.utils.data.Dataset):
                         info[audio_key] = audio_value
                 
                     del info["__audio__"]
+            # ==========================================
+
 
             return (audio, info)
         except Exception as e:
@@ -626,19 +652,23 @@ def npy_decoder(key, value):
         return None
 
 def collation_fn(samples):
-        batched = list(zip(*samples))
-        result = []
-        for b in batched:
-            if isinstance(b[0], (int, float)):
-                b = np.array(b)
-            elif isinstance(b[0], torch.Tensor):
-                b = torch.stack(b)
-            elif isinstance(b[0], np.ndarray):
-                b = np.array(b)
-            else:
-                b = b
-            result.append(b)
-        return result
+    batched_audio = torch.stack([s[0] for s in samples])
+    infos = [s[1] for s in samples]
+    
+    batched_info = {}
+    for k in infos[0].keys():
+        values = [info.get(k) for info in infos]
+        if isinstance(values[0], torch.Tensor):
+            try:
+                batched_info[k] = torch.stack(values)
+            except:
+                batched_info[k] = values
+        elif isinstance(values[0], (int, float)):
+            batched_info[k] = torch.tensor(values)
+        else:
+            batched_info[k] = values
+            
+    return [batched_audio, batched_info]
 
 class WebDatasetDataLoader():
     def __init__(
@@ -823,15 +853,32 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
             audio_dir_path = audio_dir_config.get("path", None)
             assert audio_dir_path is not None, "Path must be set for local audio directory configuration"
 
+            # custom_metadata_fn = None
+            # custom_metadata_module_path = audio_dir_config.get("custom_metadata_module", None)
+
+            # if custom_metadata_module_path is not None:
+            #     spec = importlib.util.spec_from_file_location("metadata_module", custom_metadata_module_path)
+            #     metadata_module = importlib.util.module_from_spec(spec)
+            #     spec.loader.exec_module(metadata_module)                
+
+            #     custom_metadata_fn = metadata_module.get_custom_metadata
+
             custom_metadata_fn = None
             custom_metadata_module_path = audio_dir_config.get("custom_metadata_module", None)
 
             if custom_metadata_module_path is not None:
-                spec = importlib.util.spec_from_file_location("metadata_module", custom_metadata_module_path)
-                metadata_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(metadata_module)                
-
-                custom_metadata_fn = metadata_module.get_custom_metadata
+                
+                import importlib.util
+                actual_file_path = f"/home/yonghyun/stable-audio-tools/stable_audio_tools/data/{custom_metadata_module_path}.py"
+                
+                spec = importlib.util.spec_from_file_location(custom_metadata_module_path, actual_file_path)
+                
+                if spec is not None:
+                    metadata_module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(metadata_module)
+                    custom_metadata_fn = metadata_module.get_custom_metadata
+                else:
+                    print(f"⚠️ Warning: Could not find metadata module at {actual_file_path}")
 
             configs.append(
                 LocalDatasetConfig(

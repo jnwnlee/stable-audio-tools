@@ -1,3 +1,26 @@
+"""
+=============================================================================
+File: diffusion.py
+Description: Contains model wrappers and training logic for Rectified Flow (RF)
+             and standard diffusion objectives.
+
+Key Implementations & Fixes:
+1. Rectified Flow Objective:
+   - Computes velocity targets (`noise - diffusion_input`) and utilizes 
+     linear noise schedules (`alphas = 1-t`, `sigmas = t`).
+2. "Black Hole" Parameter Routing Fix (DiTWrapper.forward):
+   - Resolved a bug in the original library where 
+     `negative_global_cond` was dropped in the argument passing. 
+   - Explicitly mapped `negative_global_cond` to `negative_global_embed` 
+     when calling the core DiT model, ensuring the Null CFG signal 
+     reaches the transformer blocks.
+3. Cleaned Training Wrapper:
+   - Removed duplicated/zombie steerability evaluation logic from 
+     `on_validation_epoch_end` to rely exclusively on the robust 
+     `RewardMonitorCallback` in the main training script.
+=============================================================================
+"""
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -173,7 +196,12 @@ class ConditionedDiffusionModelWrapper(nn.Module):
 
             # Concatenate over the channel dimension
             global_cond = torch.cat(global_conds, dim=-1)
-
+            #====MODIFIED(Yonghyun)===
+            if global_cond.shape[-1] == 1536: # 768 + 768 중복 상황
+                feat1 = global_cond[..., :768]
+                feat2 = global_cond[..., 768:]
+                global_cond = (feat1 + feat2) # 두 정보를 모두 보존하며 768로 압축
+            #==========================
             if len(global_cond.shape) == 3:
                 global_cond = global_cond.squeeze(1)
 
@@ -554,6 +582,8 @@ class DiTWrapper(ConditionedDiffusionModel):
             cfg_dropout_prob=cfg_dropout_prob,
             scale_phi=scale_phi,
             global_embed=global_cond,
+            # Null 조건을 dit.py로 연결
+            negative_global_embed=negative_global_cond,
             **kwargs)
 
 class DiTUncondWrapper(DiffusionModel):

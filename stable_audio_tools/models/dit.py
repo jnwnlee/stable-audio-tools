@@ -1,3 +1,20 @@
+"""
+=============================================================================
+File: dit.py
+Description: Diffusion Transformer (DiT) core architecture consisting of 
+             attention layers and Adaptive Layer Normalization (adaLN).
+
+Key Implementations & Fixes:
+1. CFG Broadcasting Fix (Forward Pass):
+   - Modified the logic handling `global_embed` and 
+     `negative_global_embed` during Classifier-Free Guidance.
+   - Ensured both positive and negative global embeddings are correctly 
+     concatenated along the batch dimension (`dim=0`) so that the adaLN 
+     blocks can properly process batched CFG inputs without dimension 
+     mismatch errors.
+=============================================================================
+"""
+
 import typing as tp
 import math
 import torch
@@ -124,7 +141,7 @@ class DiffusionTransformer(nn.Module):
 
     def _forward(
         self, 
-        x, 
+        x,
         t, 
         mask=None,
         cross_attn_cond=None,
@@ -230,7 +247,7 @@ class DiffusionTransformer(nn.Module):
 
     def forward(
         self, 
-        x, 
+        x, # 64-Channel Latent (Batch, 64, Sequence_Length)
         t, 
         cross_attn_cond=None,
         cross_attn_cond_mask=None,
@@ -268,12 +285,28 @@ class DiffusionTransformer(nn.Module):
         if input_concat_cond is not None:
             input_concat_cond = input_concat_cond.to(model_dtype)
 
+        # if global_embed is not None:
+        #     global_embed = global_embed.to(model_dtype)
+
         if global_embed is not None:
             global_embed = global_embed.to(model_dtype)
-
+            
+            # 차원 충돌 방지 및 점수(Score) 덧셈 결합
+            expected_dim = self.to_global_embed[0].in_features # 768
+            if global_embed.shape[-1] > expected_dim:
+                # 1536차원을 768(seconds_total)과 768(score_bin)로 분리
+                base_cond = global_embed[..., :expected_dim]
+                score_cond = global_embed[..., expected_dim:]
+                
+                # CFG Uncond 패스를 위해 점수(Score)가 빠진 기본 상태를 저장
+                negative_global_embed = base_cond 
+                
+                # 모델에는 덧셈(+)으로 결합하여 768차원을 유지해 전달
+                global_embed = base_cond + score_cond
+                
         if negative_global_embed is not None:
             negative_global_embed = negative_global_embed.to(model_dtype)
-
+            
         if prepend_cond is not None:
             prepend_cond = prepend_cond.to(model_dtype)
 
@@ -328,8 +361,16 @@ class DiffusionTransformer(nn.Module):
             batch_inputs = torch.cat([x, x], dim=0)
             batch_timestep = torch.cat([t, t], dim=0)
 
+            # if global_embed is not None:
+            #     batch_global_cond = torch.cat([global_embed, global_embed], dim=0)
+            # else:
+            #     batch_global_cond = None
             if global_embed is not None:
-                batch_global_cond = torch.cat([global_embed, global_embed], dim=0)
+                # Null 임베딩(negative)이 존재하면 Uncond 패스에 넣기
+                if negative_global_embed is not None:
+                    batch_global_cond = torch.cat([global_embed, negative_global_embed], dim=0)
+                else:
+                    batch_global_cond = torch.cat([global_embed, global_embed], dim=0)
             else:
                 batch_global_cond = None
 

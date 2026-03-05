@@ -352,13 +352,26 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         # If mask_padding is on, randomly drop the padding masks to allow for learning silence padding
         use_padding_mask = self.mask_padding and random.random() > self.mask_padding_dropout
 
-        # Check for wrapped padding masks to avoid interpolation error
-        first_padding_mask = metadata[0]["padding_mask"]
-        if isinstance(first_padding_mask, list) and len(first_padding_mask) == 1:
-            padding_masks = torch.stack([md["padding_mask"][0] for md in metadata], dim=0).to(self.device) # Shape (batch_size, sequence_length)
+        # # Check for wrapped padding masks to avoid interpolation error
+        # first_padding_mask = metadata[0]["padding_mask"]
+        # if isinstance(first_padding_mask, list) and len(first_padding_mask) == 1:
+        #     padding_masks = torch.stack([md["padding_mask"][0] for md in metadata], dim=0).to(self.device) # Shape (batch_size, sequence_length)
+        # else:
+        #     padding_masks = torch.stack([md["padding_mask"] for md in metadata], dim=0).to(self.device) # Shape (batch_size, sequence_length)
+        """
+        MODIFIED (Yonghyun)
+        """
+        # Handles both list-of-dicts and single-dict metadata
+        if isinstance(metadata, (list, tuple)):
+            first_padding_mask = metadata[0]["padding_mask"]
+            if isinstance(first_padding_mask, list) and len(first_padding_mask) == 1:
+                padding_masks = torch.stack([md["padding_mask"][0] for md in metadata], dim=0).to(self.device)
+            else:
+                padding_masks = torch.stack([md["padding_mask"] for md in metadata], dim=0).to(self.device)
         else:
-            padding_masks = torch.stack([md["padding_mask"] for md in metadata], dim=0).to(self.device) # Shape (batch_size, sequence_length)
-
+            padding_masks = metadata.get("padding_mask", None)
+            if padding_masks is not None: padding_masks = padding_masks.to(self.device)
+            
         p.tick("conditioning")
 
         if self.diffusion.pretransform is not None:
@@ -563,24 +576,45 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
                 self.validation_step_outputs[f'val/loss_{validation_timestep:.1f}'].append(val_loss.item())
 
+    # def on_validation_epoch_end(self):
+    #     log_dict = {}
+    #     for validation_timestep in self.validation_timesteps:
+    #         outputs_key = f'val/loss_{validation_timestep:.1f}'
+    #         val_loss = sum(self.validation_step_outputs[outputs_key]) / len(self.validation_step_outputs[outputs_key])
+
+    #         # Gather losses across all GPUs
+    #         val_loss = self.all_gather(val_loss).mean().item()
+
+    #         log_metric(self.logger, outputs_key, val_loss, step=self.global_step)
+
+    #     # Get average over all timesteps
+    #     val_loss = torch.tensor([val for val in self.validation_step_outputs.values()]).mean()
+
+    #     # Gather losses across all GPUs
+    #     val_loss = self.all_gather(val_loss).mean().item()
+
+    #     log_metric(self.logger, 'val/avg_loss', val_loss, step=self.global_step)
+
+    #     # Reset validation losses
+    #     for validation_timestep in self.validation_timesteps:
+    #         self.validation_step_outputs[f'val/loss_{validation_timestep:.1f}'] = []
+    
     def on_validation_epoch_end(self):
         log_dict = {}
         for validation_timestep in self.validation_timesteps:
             outputs_key = f'val/loss_{validation_timestep:.1f}'
-            val_loss = sum(self.validation_step_outputs[outputs_key]) / len(self.validation_step_outputs[outputs_key])
+            if len(self.validation_step_outputs[outputs_key]) > 0:
+                val_loss = sum(self.validation_step_outputs[outputs_key]) / len(self.validation_step_outputs[outputs_key])
+                val_loss = self.all_gather(val_loss).mean().item()
+                log_metric(self.logger, outputs_key, val_loss, step=self.global_step)
 
-            # Gather losses across all GPUs
+
+        # 기존 평균 Loss 계산 로직
+        all_losses = [v for v in self.validation_step_outputs.values() if len(v) > 0]
+        if len(all_losses) > 0:
+            val_loss = torch.tensor([sum(v)/len(v) for v in all_losses]).mean()
             val_loss = self.all_gather(val_loss).mean().item()
-
-            log_metric(self.logger, outputs_key, val_loss, step=self.global_step)
-
-        # Get average over all timesteps
-        val_loss = torch.tensor([val for val in self.validation_step_outputs.values()]).mean()
-
-        # Gather losses across all GPUs
-        val_loss = self.all_gather(val_loss).mean().item()
-
-        log_metric(self.logger, 'val/avg_loss', val_loss, step=self.global_step)
+            log_metric(self.logger, 'val/avg_loss', val_loss, step=self.global_step)
 
         # Reset validation losses
         for validation_timestep in self.validation_timesteps:

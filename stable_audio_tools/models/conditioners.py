@@ -1,4 +1,21 @@
-#Heavily influenced by https://github.com/facebookresearch/audiocraft/blob/main/audiocraft/modules/conditioners.py
+# Heavily influenced by https://github.com/facebookresearch/audiocraft/blob/main/audiocraft/modules/conditioners.py
+"""
+=============================================================================
+File: conditioners.py
+Description: Handles various conditioning inputs (Text via T5, Timing, 
+             and custom Quality Scores) before feeding them into the DiT.
+
+Key Implementations & Fixes:
+1. ScoreBinConditioner:
+   - Introduced a new conditioning module to handle discrete `score_bin` 
+     inputs (0 to 10).
+2. Unconditional Baseline Preservation:
+   - Explicitly designed Bin 0 (Null condition) to return a Zero Vector.
+   - This ensures that when no score condition is provided, the model 
+     defaults to its original, pre-trained unconditional generation 
+     behavior without identity shift.
+=============================================================================
+"""
 
 import torch
 import logging, warnings
@@ -46,8 +63,6 @@ class IntConditioner(Conditioner):
 
     def forward(self, ints: tp.List[int], device=None) -> tp.Any:
             
-            #self.int_embedder.to(device)
-    
             ints = torch.tensor(ints).to(device)
             ints = ints.clamp(self.min_val, self.max_val)
     
@@ -73,8 +88,16 @@ class NumberConditioner(Conditioner):
 
     def forward(self, floats: tp.List[float], device=None) -> tp.Any:
     
-            # Cast the inputs to floats
-            floats = [float(x) for x in floats]
+            new_floats = []
+            for x in floats:
+                if torch.is_tensor(x):
+                    if x.numel() > 1:
+                        new_floats.extend([float(v) for v in x.flatten()])
+                    else:
+                        new_floats.append(float(x.item()))
+                else:
+                    new_floats.append(float(x))
+            floats = new_floats
 
             floats = torch.tensor(floats).to(device)
 
@@ -328,8 +351,6 @@ class T5Conditioner(Conditioner):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
-                # self.tokenizer = T5Tokenizer.from_pretrained(t5_model_name, model_max_length = max_length)
-                # model = T5EncoderModel.from_pretrained(t5_model_name, max_length=max_length).train(enable_grad).requires_grad_(enable_grad)
                 self.tokenizer = AutoTokenizer.from_pretrained(t5_model_name)
                 model = T5EncoderModel.from_pretrained(t5_model_name).train(enable_grad).requires_grad_(enable_grad).to(torch.float16)
             finally:
@@ -652,34 +673,89 @@ class MultiConditioner(nn.Module):
         self.pre_encoded_keys = pre_encoded_keys
 
     def forward(self, batch_metadata: tp.List[tp.Dict[str, tp.Any]], device: tp.Union[torch.device, str]) -> tp.Dict[str, tp.Any]:
+        import os, json
+        
+        # 1. Normalize input data (Handle dataloader worker type mismatch)
+        batch_list = []
+        if isinstance(batch_metadata, dict):
+            batch_list = [batch_metadata]
+        elif isinstance(batch_metadata, (list, tuple)):
+            for x in batch_metadata:
+                # Extract the first element (dict) if wrapped in a tuple
+                if isinstance(x, (list, tuple)) and len(x) > 0: 
+                    batch_list.append(x[0])
+                else: 
+                    batch_list.append(x)
+        
+        # 2. Metadata correction and JSON-based Reward Score injection
+        for i in range(len(batch_list)):
+            # Wrap string inputs into a dictionary to prevent AttributeError
+            if not isinstance(batch_list[i], dict):
+                val = batch_list[i]
+                batch_list[i] = {"path": str(val), "prompt": str(val)}
+            
+            meta = batch_list[i]
+            path = meta.get("path", "")
+            
+            # If an audio file path exists, look for a matching .json file to inject data
+            if isinstance(path, str) and path.lower().endswith(('.mp3', '.wav', '.flac')):
+                json_path = os.path.splitext(path)[0] + ".json"
+                if os.path.exists(json_path):
+                    try:
+                        with open(json_path, 'r') as f:
+                            j_data = json.load(f)
+                            txt = j_data.get("prompt", j_data.get("text", "A music song."))
+                            # Force synchronization between text and reward score
+                            meta["prompt"] = txt
+                            meta["text"] = txt
+                            # Added stability for score parsing
+                            meta["reward_score"] = float(j_data.get("reward_score", 0.0))
+                    except: 
+                        pass
+            
+            # Minimum default fallbacks
+            if "prompt" not in meta: meta["prompt"] = "A music song."
+            if "text" not in meta: meta["text"] = "A music song."
+            # FIX: score_bin is an integer index, default to 0 instead of 0.0
+            if "score_bin" not in meta: meta["score_bin"] = 0 
+            elif "reward_score" not in meta: meta["reward_score"] = 0.0
+
+        # 3. Execute condition-specific operations and enforce consistent batch sizes
         output = {}
+        actual_batch_size = len(batch_list)
 
         for key, conditioner in self.conditioners.items():
-            condition_key = key
-
             conditioner_inputs = []
-
-            for x in batch_metadata:
-
-                if condition_key not in x:
-                    if condition_key in self.default_keys:
-                        condition_key = self.default_keys[condition_key]
-                    else:
-                        raise ValueError(f"Conditioner key {condition_key} not found in batch metadata")
-
-                #Unwrap the condition info if it's a single-element list or tuple, this is to support collation functions that wrap everything in a list
-                if (isinstance(x[condition_key], list) or isinstance(x[condition_key], tuple)) and len(x[condition_key]) == 1:
-                    conditioner_input = x[condition_key][0]
-                    
+            for x in batch_list:
+                # Explicit type defense for the score_bin key
+                if key == "score_bin":
+                    val = x.get(key, 0)
                 else:
-                    conditioner_input = x[condition_key]
-
-                conditioner_inputs.append(conditioner_input)
+                    val = x.get(key, x.get(self.default_keys.get(key, key), "A music song."))
+                
+                # Unwrap single-element lists/tuples
+                if isinstance(val, (list, tuple)) and len(val) == 1: 
+                    val = val[0]
+                conditioner_inputs.append(val)
 
             if key in self.pre_encoded_keys:
                 output[key] = [torch.stack(conditioner_inputs, dim=0).to(device), None]
             else:
-                output[key] = conditioner(conditioner_inputs, device)
+                # Retrieve the final embeddings from the specific conditioner
+                res = conditioner(conditioner_inputs, device)
+                
+                # FIX CORE: Avoid in-place operations during DDP batch size alignment 
+                # Use .contiguous() to prevent computational graph detachment
+                if isinstance(res, (list, tuple)):
+                    processed_res = []
+                    for r in res:
+                        if torch.is_tensor(r) and r.shape[0] > actual_batch_size:
+                            processed_res.append(r[:actual_batch_size, ...].contiguous())
+                        else:
+                            processed_res.append(r)
+                    output[key] = processed_res
+                else:
+                    output[key] = res
 
         return output
     
@@ -719,6 +795,8 @@ def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.An
             conditioners[id] = NumberConditioner(**conditioner_config)
         elif conditioner_type == "list":
             conditioners[id] = ListConditioner(**conditioner_config)
+        elif conditioner_type == "score_bin":
+            conditioners[id] = ScoreBinConditioner(**conditioner_config)
         elif conditioner_type == "phoneme":
             conditioners[id] = PhonemeConditioner(**conditioner_config)
         elif conditioner_type == "lut":
@@ -759,3 +837,57 @@ def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.An
             raise ValueError(f"Unknown conditioner type: {conditioner_type}")
 
     return MultiConditioner(conditioners, default_keys=default_keys, pre_encoded_keys=pre_encoded_keys)
+
+
+class ScoreBinConditioner(Conditioner):
+    """
+    Categorical embedding layer for reward score bins.
+    Bin 0 is reserved for the Unconditional class (CFG Null drop).
+    Bins 1-10 represent the actual score ranges.
+    """
+    def __init__(self, output_dim: int, num_bins: int = 11, project_out: bool = False):
+        super().__init__(output_dim, output_dim, project_out=project_out)
+        self.num_bins = num_bins
+        
+        # Additive embedding space for DiT global_cond
+        self.embedding = nn.Embedding(num_embeddings=self.num_bins, embedding_dim=output_dim)
+
+        # Initialize embedding weights to zero directly.
+        # This guarantees 100% preservation of the pretrained temporal conditioning at Step 0,
+        # while removing the alpha_gate to allow full gradient flow from Step 1.
+        with torch.no_grad():
+            self.embedding.weight.fill_(0)
+
+    def forward(self, inputs: tp.Any, device: tp.Union[torch.device, str]) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+        self.embedding.to(device)
+        
+        # 1. Parse incoming data format (Handle list of floats, ints, or dicts)
+        parsed_bins = []
+        for x in inputs:
+            if isinstance(x, dict):
+                val = x.get("score_bin", 0)
+            elif torch.is_tensor(x):
+                val = x.item() if x.numel() == 1 else x.flatten()[0].item()
+            else:
+                val = x
+                
+            try:
+                parsed_bins.append(int(val))
+            except (ValueError, TypeError):
+                parsed_bins.append(0) # Fallback to Unconditional(Null) if parsing fails
+
+        # 2. Convert to tensor and clamp safety
+        x_tensor = torch.tensor(parsed_bins, dtype=torch.long, device=device)
+        x_tensor = torch.clamp(x_tensor, 0, self.num_bins - 1)
+
+        if x_tensor.dim() == 1:
+            x_tensor = x_tensor.unsqueeze(1) # Shape: (batch_size, 1)
+        
+        # 3. Vector mapping (Directly returning the embeddings)
+        emb = self.embedding(x_tensor) # Shape: (batch_size, 1, output_dim)
+
+        # 0번 Bin(Null)은 무조건 완벽한 Zero 벡터로 강제 고정
+        emb = torch.where((x_tensor == 0).unsqueeze(-1), torch.zeros_like(emb), emb)
+
+        # 4. Standardized Return: [embeddings, attention_mask]
+        return [emb, torch.ones(emb.shape[0], 1).to(device)]
