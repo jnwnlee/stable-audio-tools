@@ -427,6 +427,7 @@ def main():
     # # 2 & 3. Score binning을 모델 내부에 전달 (Global Embedder)
     target_tensors = [
         "conditioner.conditioners.score_bin.embedding.weight",
+        "model.model.input_add_adapter.weight",
         "model.model.to_global_embed.0.weight",
         "model.model.to_global_embed.2.weight"
     ]
@@ -445,8 +446,8 @@ def main():
     
     unfrozen_count = 0
     for name, param in model.named_parameters():
-        # score_bin(임베딩), to_global_embed(관문), adaLN(수신부)를 모두 엽니다.
-        if any(key in name for key in ["score_bin", "to_global_embed", "adaLN"]):
+        # score_bin(임베딩), input_add_adapter(입력 관문), to_global_embed/adaLN(기존 실험 관문/수신부)을 엽니다.
+        if any(key in name for key in ["score_bin", "input_add_adapter", "to_global_embed", "adaLN"]):
             param.requires_grad_(True)
             unfrozen_count += 1
             print(f"  🟢 [UNFROZEN] {name} (Shape: {list(param.shape)})")

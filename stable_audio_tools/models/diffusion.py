@@ -95,12 +95,14 @@ class ConditionedDiffusionModel(nn.Module):
                 *args,
                 supports_cross_attention: bool = False,
                 supports_input_concat: bool = False,
+                supports_input_add_cond: bool = False,
                 supports_global_cond: bool = False,
                 supports_prepend_cond: bool = False,
                 **kwargs):
         super().__init__(*args, **kwargs)
         self.supports_cross_attention = supports_cross_attention
         self.supports_input_concat = supports_input_concat
+        self.supports_input_add_cond = supports_input_add_cond
         self.supports_global_cond = supports_global_cond
         self.supports_prepend_cond = supports_prepend_cond
 
@@ -110,6 +112,7 @@ class ConditionedDiffusionModel(nn.Module):
                 cross_attn_cond: torch.Tensor = None,
                 cross_attn_mask: torch.Tensor = None,
                 input_concat_cond: torch.Tensor = None,
+                input_add_cond: torch.Tensor = None,
                 global_embed: torch.Tensor = None,
                 prepend_cond: torch.Tensor = None,
                 prepend_cond_mask: torch.Tensor = None,
@@ -137,6 +140,7 @@ class ConditionedDiffusionModelWrapper(nn.Module):
             cross_attn_cond_ids: tp.List[str] = [],
             global_cond_ids: tp.List[str] = [],
             input_concat_ids: tp.List[str] = [],
+            input_add_ids: tp.List[str] = [],
             prepend_cond_ids: tp.List[str] = [],
             ):
         super().__init__()
@@ -150,6 +154,7 @@ class ConditionedDiffusionModelWrapper(nn.Module):
         self.cross_attn_cond_ids = cross_attn_cond_ids
         self.global_cond_ids = global_cond_ids
         self.input_concat_ids = input_concat_ids
+        self.input_add_ids = input_add_ids
         self.prepend_cond_ids = prepend_cond_ids
         self.min_input_length = min_input_length
 
@@ -162,8 +167,36 @@ class ConditionedDiffusionModelWrapper(nn.Module):
         cross_attention_masks = None
         global_cond = None
         input_concat_cond = None
+        input_add_cond = None
         prepend_cond = None
         prepend_cond_mask = None
+
+        def collect_channelwise_conds(cond_ids: tp.List[str], cond_name: str):
+            if len(cond_ids) == 0:
+                return None
+
+            cond_tensors = []
+            target_length = 0
+
+            for key in cond_ids:
+                cond_tensor = conditioning_tensors[key][0]
+
+                if len(cond_tensor.shape) == 2:
+                    cond_tensor = cond_tensor.unsqueeze(1)
+
+                if len(cond_tensor.shape) != 3:
+                    raise ValueError(f"{cond_name} conditioner '{key}' must be 3D, got {tuple(cond_tensor.shape)}")
+
+                cond_tensors.append(cond_tensor)
+                target_length = max(target_length, cond_tensor.shape[2])
+
+            if target_length > 0:
+                cond_tensors = [
+                    F.interpolate(cond, (target_length,), mode='nearest') if cond.shape[2] != target_length else cond
+                    for cond in cond_tensors
+                ]
+
+            return torch.cat(cond_tensors, dim=1)
 
         if len(self.cross_attn_cond_ids) > 0:
             # Concatenate all cross-attention inputs over the sequence dimension
@@ -207,8 +240,11 @@ class ConditionedDiffusionModelWrapper(nn.Module):
 
         if len(self.input_concat_ids) > 0:
             # Concatenate all input concat conditioning inputs over the channel dimension
-            # Assumes that the input concat conditioning inputs are of shape (batch, channels, seq)
-            input_concat_cond = torch.cat([conditioning_tensors[key][0] for key in self.input_concat_ids], dim=1)
+            input_concat_cond = collect_channelwise_conds(self.input_concat_ids, "input concat")
+
+        if len(self.input_add_ids) > 0:
+            # Concatenate all input add conditioning inputs over the channel dimension
+            input_add_cond = collect_channelwise_conds(self.input_add_ids, "input add")
 
         if len(self.prepend_cond_ids) > 0:
             # Concatenate all prepend conditioning inputs over the sequence dimension
@@ -229,7 +265,8 @@ class ConditionedDiffusionModelWrapper(nn.Module):
                 "negative_cross_attn_cond": cross_attention_input,
                 "negative_cross_attn_mask": cross_attention_masks,
                 "negative_global_cond": global_cond,
-                "negative_input_concat_cond": input_concat_cond
+                "negative_input_concat_cond": input_concat_cond,
+                "negative_input_add_cond": input_add_cond
             }
         else:
             return {
@@ -237,12 +274,21 @@ class ConditionedDiffusionModelWrapper(nn.Module):
                 "cross_attn_mask": cross_attention_masks,
                 "global_cond": global_cond,
                 "input_concat_cond": input_concat_cond,
+                "input_add_cond": input_add_cond,
                 "prepend_cond": prepend_cond,
                 "prepend_cond_mask": prepend_cond_mask
             }
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, cond: tp.Dict[str, tp.Any], **kwargs):
-        return self.model(x, t, **self.get_conditioning_inputs(cond), **kwargs)
+        cond_inputs = self.get_conditioning_inputs(cond)
+
+        if cond_inputs.get("input_concat_cond", None) is not None and not self.model.supports_input_concat:
+            raise ValueError("input_concat_cond was provided, but the wrapped model does not support input concat conditioning")
+
+        if cond_inputs.get("input_add_cond", None) is not None and not self.model.supports_input_add_cond:
+            raise ValueError("input_add_cond was provided, but the wrapped model does not support input add conditioning")
+
+        return self.model(x, t, **cond_inputs, **kwargs)
 
     def generate(self, *args, **kwargs):
         return generate_diffusion_cond(self, *args, **kwargs)
@@ -539,7 +585,12 @@ class DiTWrapper(ConditionedDiffusionModel):
         *args,
         **kwargs
     ):
-        super().__init__(supports_cross_attention=True, supports_global_cond=False, supports_input_concat=False)
+        super().__init__(
+            supports_cross_attention=True,
+            supports_global_cond=False,
+            supports_input_concat=True,
+            supports_input_add_cond=True,
+        )
 
         self.diffusion_objective = diffusion_objective
 
@@ -554,6 +605,8 @@ class DiTWrapper(ConditionedDiffusionModel):
                 negative_cross_attn_mask=None,
                 input_concat_cond=None,
                 negative_input_concat_cond=None,
+                input_add_cond=None,
+                negative_input_add_cond=None,
                 global_cond=None,
                 negative_global_cond=None,
                 prepend_cond=None,
@@ -576,6 +629,9 @@ class DiTWrapper(ConditionedDiffusionModel):
             negative_cross_attn_cond=negative_cross_attn_cond,
             negative_cross_attn_mask=negative_cross_attn_mask,
             input_concat_cond=input_concat_cond,
+            negative_input_concat_cond=negative_input_concat_cond,
+            input_add_cond=input_add_cond,
+            negative_input_add_cond=negative_input_add_cond,
             prepend_cond=prepend_cond,
             prepend_cond_mask=prepend_cond_mask,
             cfg_scale=cfg_scale,
@@ -690,6 +746,7 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
     cross_attention_ids = diffusion_config.get('cross_attention_cond_ids', [])
     global_cond_ids = diffusion_config.get('global_cond_ids', [])
     input_concat_ids = diffusion_config.get('input_concat_ids', [])
+    input_add_ids = diffusion_config.get('input_add_ids', [])
     prepend_cond_ids = diffusion_config.get('prepend_cond_ids', [])
 
     pretransform = model_config.get("pretransform", None)
@@ -730,6 +787,7 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
         cross_attn_cond_ids=cross_attention_ids,
         global_cond_ids=global_cond_ids,
         input_concat_ids=input_concat_ids,
+        input_add_ids=input_add_ids,
         prepend_cond_ids=prepend_cond_ids,
         pretransform=pretransform,
         io_channels=io_channels,

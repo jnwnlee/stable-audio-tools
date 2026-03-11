@@ -36,6 +36,8 @@ class DiffusionTransformer(nn.Module):
         global_cond_dim=0,
         project_global_cond=True,
         input_concat_dim=0,
+        input_add_dim=0,
+        input_add_use_adapter=False,
         prepend_cond_dim=0,
         depth=12,
         num_heads=8,
@@ -101,6 +103,12 @@ class DiffusionTransformer(nn.Module):
             )
 
         self.input_concat_dim = input_concat_dim
+        self.input_add_dim = input_add_dim
+        self.input_add_use_adapter = input_add_use_adapter and self.input_add_dim > 0
+
+        if self.input_add_use_adapter:
+            self.input_add_adapter = nn.Conv1d(self.input_add_dim, io_channels, kernel_size=1, bias=False)
+            nn.init.zeros_(self.input_add_adapter.weight)
 
         dim_in = io_channels + self.input_concat_dim
 
@@ -147,6 +155,7 @@ class DiffusionTransformer(nn.Module):
         cross_attn_cond=None,
         cross_attn_cond_mask=None,
         input_concat_cond=None,
+        input_add_cond=None,
         global_embed=None,
         prepend_cond=None,
         prepend_cond_mask=None,
@@ -175,12 +184,46 @@ class DiffusionTransformer(nn.Module):
             prepend_length = prepend_cond.shape[1]
 
         if input_concat_cond is not None:
-            # Interpolate input_concat_cond to the same length as x
+            if not torch.is_tensor(input_concat_cond):
+                raise TypeError("input_concat_cond must be a tensor or None")
+
+            if input_concat_cond.dim() == 2:
+                input_concat_cond = input_concat_cond.unsqueeze(1)
+            if input_concat_cond.dim() != 3:
+                raise ValueError(f"input_concat_cond tensor must be 3D, got shape {tuple(input_concat_cond.shape)}")
+
+            if self.input_concat_dim > 0 and input_concat_cond.shape[1] != self.input_concat_dim:
+                raise ValueError(
+                    f"input_concat_cond channel mismatch: expected {self.input_concat_dim}, got {input_concat_cond.shape[1]}"
+                )
+
             if input_concat_cond.shape[2] != x.shape[2]:
-                input_concat_cond = F.interpolate(input_concat_cond, (x.shape[2], ), mode='nearest')
+                input_concat_cond = F.interpolate(input_concat_cond, (x.shape[2],), mode="nearest")
 
             x = torch.cat([x, input_concat_cond], dim=1)
+            
+        if input_add_cond is not None:
+            if not torch.is_tensor(input_add_cond):
+                raise TypeError("input_add_cond must be a tensor or None")
 
+            if input_add_cond.dim() == 2:
+                input_add_cond = input_add_cond.unsqueeze(1)
+            if input_add_cond.dim() != 3:
+                raise ValueError(f"input_add_cond tensor must be 3D, got shape {tuple(input_add_cond.shape)}")
+
+            if self.input_add_dim > 0 and input_add_cond.shape[1] != self.input_add_dim:
+                raise ValueError(
+                    f"input_add_cond channel mismatch: expected {self.input_add_dim}, got {input_add_cond.shape[1]}"
+                )
+
+            if input_add_cond.shape[2] != x.shape[2]:
+                input_add_cond = F.interpolate(input_add_cond, (x.shape[2],), mode="nearest")
+
+            if not self.input_add_use_adapter:
+                raise ValueError("input_add_cond was provided but input_add_use_adapter is disabled")
+
+            x = x + self.input_add_adapter(input_add_cond)
+            
         # Get the batch of timestep embeddings
         timestep_embed = self.to_timestep_embed(self.timestep_features(t[:, None])) # (b, embed_dim)
 
@@ -254,6 +297,9 @@ class DiffusionTransformer(nn.Module):
         negative_cross_attn_cond=None,
         negative_cross_attn_mask=None,
         input_concat_cond=None,
+        negative_input_concat_cond=None,
+        input_add_cond=None,
+        negative_input_add_cond=None,
         global_embed=None,
         negative_global_embed=None,
         prepend_cond=None,
@@ -284,6 +330,15 @@ class DiffusionTransformer(nn.Module):
 
         if input_concat_cond is not None:
             input_concat_cond = input_concat_cond.to(model_dtype)
+
+        if negative_input_concat_cond is not None:
+            negative_input_concat_cond = negative_input_concat_cond.to(model_dtype)
+
+        if input_add_cond is not None:
+            input_add_cond = input_add_cond.to(model_dtype)
+
+        if negative_input_add_cond is not None:
+            negative_input_add_cond = negative_input_add_cond.to(model_dtype)
 
         # if global_embed is not None:
         #     global_embed = global_embed.to(model_dtype)
@@ -327,6 +382,7 @@ class DiffusionTransformer(nn.Module):
                 cross_attn_cond=cross_attn_cond, 
                 cross_attn_cond_mask=cross_attn_cond_mask, 
                 input_concat_cond=input_concat_cond, 
+                input_add_cond=input_add_cond,
                 global_embed=global_embed, 
                 prepend_cond=prepend_cond, 
                 prepend_cond_mask=prepend_cond_mask,
@@ -354,7 +410,7 @@ class DiffusionTransformer(nn.Module):
         elif self.diffusion_objective in ["rectified_flow", "rf_denoiser"]:
             sigma = t
 
-        if cfg_scale != 1.0 and (cross_attn_cond is not None or prepend_cond is not None) and (cfg_interval[0] <= sigma[0] <= cfg_interval[1]):
+        if cfg_scale != 1.0 and (cross_attn_cond is not None or prepend_cond is not None or input_concat_cond is not None or input_add_cond is not None) and (cfg_interval[0] <= sigma[0] <= cfg_interval[1]):
 
             # Classifier-free guidance
             # Concatenate conditioned and unconditioned inputs on the batch dimension            
@@ -375,9 +431,20 @@ class DiffusionTransformer(nn.Module):
                 batch_global_cond = None
 
             if input_concat_cond is not None:
-                batch_input_concat_cond = torch.cat([input_concat_cond, input_concat_cond], dim=0)
+                if negative_input_concat_cond is not None:
+                    batch_input_concat_cond = torch.cat([input_concat_cond, negative_input_concat_cond], dim=0)
+                else:
+                    batch_input_concat_cond = torch.cat([input_concat_cond, input_concat_cond], dim=0)
             else:
                 batch_input_concat_cond = None
+
+            if input_add_cond is not None:
+                if negative_input_add_cond is not None:
+                    batch_input_add_cond = torch.cat([input_add_cond, negative_input_add_cond], dim=0)
+                else:
+                    batch_input_add_cond = torch.cat([input_add_cond, input_add_cond], dim=0)
+            else:
+                batch_input_add_cond = None
 
             batch_cond = None
             batch_cond_masks = None
@@ -429,6 +496,7 @@ class DiffusionTransformer(nn.Module):
                 cross_attn_cond_mask=batch_cond_masks, 
                 mask = batch_masks, 
                 input_concat_cond=batch_input_concat_cond, 
+                input_add_cond=batch_input_add_cond,
                 global_embed = batch_global_cond,
                 prepend_cond = batch_prepend_cond,
                 prepend_cond_mask = batch_prepend_cond_mask,
@@ -463,6 +531,7 @@ class DiffusionTransformer(nn.Module):
                 cross_attn_cond=cross_attn_cond, 
                 cross_attn_cond_mask=cross_attn_cond_mask, 
                 input_concat_cond=input_concat_cond, 
+                input_add_cond=input_add_cond,
                 global_embed=global_embed, 
                 prepend_cond=prepend_cond, 
                 prepend_cond_mask=prepend_cond_mask,
