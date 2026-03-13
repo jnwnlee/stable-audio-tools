@@ -920,11 +920,12 @@ class ContinuousScoreConditioner(nn.Module):
         
         # 3. Linear 계층을 통과시킵니다.
         embeds = self.mapper(x)
+        embeds = embeds.unsqueeze(-1)
         
         # 4. CFG Null condition handling (-999.0)
-        null_mask = (x == -999.0).squeeze(-1)
-        if null_mask.any():
-            embeds[null_mask] = 0.0
+        null_idx = (x.squeeze(-1) == -999.0)
+        if null_idx.any():
+            embeds[null_idx] = 0.0
 
         # Return embeddings and a fully active mask on the correct device
         mask = torch.ones(embeds.shape[0], 1, device=device)

@@ -70,12 +70,15 @@
             ],
             "cond_dim": 768
         },
-        "diffusion": {
+"diffusion": {
             "cross_attention_cond_ids": [
                 "prompt",
                 "seconds_total"
             ],
             "global_cond_ids": [
+                "seconds_total"
+            ],
+            "input_add_ids": [
                 "continuous_score"
             ],
             "diffusion_objective": "rf_denoiser",
@@ -87,6 +90,8 @@
                 "num_heads": 8,
                 "cond_token_dim": 768,
                 "global_cond_dim": 768,
+                "input_add_dim": 768,
+                "input_add_use_adapter": true,
                 "transformer_type": "continuous_transformer",
                 "attn_kwargs": {
                     "qk_norm": "ln"
