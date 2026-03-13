@@ -48,6 +48,45 @@ from stable_audio_tools.models import create_model_from_config
 from stable_audio_tools.models.utils import copy_state_dict, load_ckpt_state_dict
 from stable_audio_tools.training import create_training_wrapper_from_config, create_demo_callback_from_config
 
+# Replace the existing ScoreBinningDatasetWrapper with this one
+class ContinuousScoreDatasetWrapper(torch.utils.data.Dataset):
+    """
+    Passes the raw, continuous reward score directly to the model.
+    Applies CFG dropout, and robustly handles missing/corrupted FMA files to prevent DDP deadlocks.
+    """
+    def __init__(self, dataset, is_training=True, cfg_drop_rate=0.15):
+        self.dataset = dataset
+        self.is_training = is_training
+        self.cfg_drop_rate = cfg_drop_rate
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        try:
+            audio, metadata = self.dataset[idx]
+        except Exception as e:
+            return self.__getitem__((idx + 1) % len(self))
+        
+        # Deep copy to prevent caching the null condition permanently
+        metadata = metadata.copy()
+
+        raw_score = metadata.get('reward_score', 0.0)
+        if torch.is_tensor(raw_score): 
+            raw_score = raw_score.item()
+        elif isinstance(raw_score, list): 
+            raw_score = raw_score[0]
+        
+        score_val = float(raw_score)
+        
+        # CFG Dropout: 15% chance to assign the null condition (-999.0)
+        if self.is_training and torch.rand(1).item() < self.cfg_drop_rate:
+            score_val = -999.0 
+            
+        # Replace 'score_bin' with 'continuous_score'
+        metadata['continuous_score'] = score_val
+        return audio, metadata
+    
 class ScoreBinningDatasetWrapper(torch.utils.data.Dataset):
     """
     Intercepts the dataloader to convert continuous scalars to discrete bins (1-10).
@@ -234,44 +273,33 @@ class RewardMonitorCallback(pl.Callback):
                     clean_p = str(p_val)
                     clean_s = 10.0 
 
-                    # Bin 0 (Baseline) vs Bin 1~10 (Steering) Logic
+                    # 🎯 Continuous Score & Null (CFG) Logic Setup
                     if self.use_score_conditioning and generated_count < 10:
-                        target_bin = 0
-                        target_val = 0.0 # Baseline will be excluded from statistical calculations
+                        target_val = -999.0 # Null (Baseline)
                     else:
-                        target_bin = 10 - (generated_count % 10) if self.use_score_conditioning else 0
-                        target_val = float(self.target_score_list[generated_count % 10]) if self.use_score_conditioning else 0.0
+                        target_val = float(self.target_score_list[generated_count % 10]) if self.use_score_conditioning else -999.0
 
                     single_cond_input = [{
                         "prompt": clean_p,
                         "seconds_total": clean_s,
-                        "score_bin": target_bin
+                        "continuous_score": target_val 
                     }]
 
-                    # [추가] CFG 상쇄를 막기 위한 완벽한 Null 조건 명시
+                    # Explicitly define the negative condition for CFG
                     negative_cond_input = [{
-                        "prompt": "",              # 프롬프트 비우기
-                        "seconds_total": clean_s,  # 길이는 유지
-                        "score_bin": 0             # 점수는 Null(0)로 
+                        "prompt": "",              
+                        "seconds_total": clean_s,  
+                        "continuous_score": -999.0 # Absolute Null condition
                     }]
                     
                     try:
                         target_sample_size = int(model_sr * clean_s)
                         
-                        # # Generate audio
-                        # gen_audio = pl_module.diffusion.generate(
-                        #     conditioning=single_cond_input,
-                        #     steps=50,
-                        #     cfg_scale=1.5, 
-                        #     batch_size=1,
-                        #     sample_size=target_sample_size
-                        # )
-                        # Generate audio
                         gen_audio = pl_module.diffusion.generate(
                             conditioning=single_cond_input,
-                            negative_conditioning=negative_cond_input, # CFG 상쇄 방지를 위한 Null 조건 추가
+                            negative_conditioning=negative_cond_input, 
                             steps=50,
-                            cfg_scale=1.5, 
+                            cfg_scale=3.5, 
                             batch_size=1,
                             sample_size=target_sample_size
                         )
@@ -282,7 +310,7 @@ class RewardMonitorCallback(pl.Callback):
                         audio_to_save = torch.clamp(gen_audio[0].cpu().float(), -1.0, 1.0)
                         
                         safe_prompt = "".join(x for x in clean_p[:15] if x.isalnum() or x.isspace()).replace(" ", "")
-                        filename = f"sample_{generated_count}_bin_{target_bin}_{safe_prompt}.wav"
+                        filename = f"sample_{generated_count}_target_{target_val:.2f}_{safe_prompt}.wav"
                         save_path = os.path.join(save_dir, filename)
                         torchaudio.save(save_path, audio_to_save, model_sr)
 
@@ -296,7 +324,7 @@ class RewardMonitorCallback(pl.Callback):
                         score = self.reward_model(concat_feat).item()
 
                         # Statistics and WandB Audio Logging
-                        if target_bin != 0:
+                        if target_val != -999.0:
                             target_scores_log.append(target_val)
                             measured_scores_log.append(score)
                             bin_scores[generated_count % 10].append(score)
@@ -304,19 +332,19 @@ class RewardMonitorCallback(pl.Callback):
                         if trainer.logger and isinstance(trainer.logger, pl.loggers.WandbLogger):
                             import wandb
                             trainer.logger.experiment.log({
-                                f"val_audio/Bin_{target_bin}": wandb.Audio(
+                                f"val_audio/Target_{target_val:.2f}": wandb.Audio(
                                     save_path,
                                     sample_rate=model_sr,
-                                    caption=f"Prompt: {clean_p} | Bin: {target_bin} | Target: {target_val:.2f} | Score: {score:.2f}"
+                                    caption=f"Prompt: {clean_p} | Target: {target_val:.2f} | Score: {score:.2f}"
                                 )
                             }, commit=False)
 
-                        print(f"[*] Generated Sample {generated_count} (Bin: {target_bin})")
-                        generated_count += 1 # Increment count is required!
+                        print(f"[*] Generated Sample {generated_count} (Target: {target_val:.2f})")
+                        generated_count += 1 
 
                     except Exception as e:
                         print(f"!!! Error at sample {generated_count}: {e}")
-                        generated_count += 1 # Skip to next on error
+                        generated_count += 1 
                         continue
                     
         # Final log calculation and output
@@ -325,8 +353,7 @@ class RewardMonitorCallback(pl.Callback):
             corr_matrix = torch.corrcoef(stacked)
             correlation = corr_matrix[0, 1].item() if not torch.isnan(corr_matrix[0, 1]) else 0.0
             
-            #self.log("val/reward_correlation", correlation, sync_dist=True)
-            self.log("val/reward_correlation", correlation, rank_zero_only=True)
+            pl_module.log("val/reward_correlation", correlation, rank_zero_only=True)
             print(f"\n[*] Epoch {trainer.current_epoch} - Correlation: {correlation:.4f}")
             print("-" * 50)
              
@@ -336,8 +363,7 @@ class RewardMonitorCallback(pl.Callback):
                     target_score = self.target_score_list[i]
                     percentile = (i + 1) * 10
                     
-                    #self.log(f"val/measured_score_top_{percentile}_percent", avg_bin_score, sync_dist=True)
-                    self.log(f"val/measured_score_top_{percentile}_percent", avg_bin_score, rank_zero_only=True)
+                    pl_module.log(f"val/measured_score_top_{percentile}_percent", avg_bin_score, rank_zero_only=True)
                     print(f"  - Target Top {percentile}% (Val: {target_score:.2f}) -> Measured Avg: {avg_bin_score:.4f}")
             print("-" * 50)
             
@@ -372,9 +398,15 @@ def main():
     target_score_list = [float(th_data.get(f"top_{i*10}_percent", 0.0)) for i in range(1, 11)]
 
     # Create wrapped Train Dataset
-    wrapped_train_set = ScoreBinningDatasetWrapper(
+    # wrapped_train_set = ScoreBinningDatasetWrapper(
+    #     train_set, 
+    #     thresholds=target_score_list, 
+    #     is_training=True, 
+    #     cfg_drop_rate=0.15
+    # )
+
+    wrapped_train_set = ContinuousScoreDatasetWrapper(
         train_set, 
-        thresholds=target_score_list, 
         is_training=True, 
         cfg_drop_rate=0.15
     )
@@ -400,9 +432,14 @@ def main():
         )
         val_set = temp_val_dl.dataset
         
-        wrapped_val_set = ScoreBinningDatasetWrapper(
+        # wrapped_val_set = ScoreBinningDatasetWrapper(
+        #     val_set, 
+        #     thresholds=target_score_list, 
+        #     is_training=False, 
+        #     cfg_drop_rate=0.0
+        # )
+        wrapped_val_set = ContinuousScoreDatasetWrapper(
             val_set, 
-            thresholds=target_score_list, 
             is_training=False, 
             cfg_drop_rate=0.0
         )
@@ -437,17 +474,17 @@ def main():
     # # ==========================================================
     # # 1. AdaLN 안테나 개방
     # # ==========================================================
-    # print("[*] 🥶 Freezing DiT core backbone, but opening AdaLN gates...")
-    # model.requires_grad_(False)
+    print("[*] 🥶 Freezing DiT core backbone, but opening AdaLN gates...")
+    model.requires_grad_(False)
     
     # # 조향 신호가 흐르는 핵심 통로인 'adaLN' 파라미터를 추가로 해제합니다.
-    # print("\n[*] --- List of UNFROZEN Parameters ---")
+    print("\n[*] --- List of UNFROZEN Parameters ---")
     
     
     unfrozen_count = 0
     for name, param in model.named_parameters():
-        # score_bin(임베딩), input_add_adapter(입력 관문), to_global_embed/adaLN(기존 실험 관문/수신부)을 엽니다.
-        if any(key in name for key in ["score_bin", "input_add_adapter", "to_global_embed", "adaLN"]):
+        # continuous_score(수신기), to_global_embed(기존 관문), adaLN(기존 조향), input_add_adapter(새로운 조향) 개방
+        if any(key in name for key in ["continuous_score", "score_bin", "to_global_embed", "adaLN"]):
             param.requires_grad_(True)
             unfrozen_count += 1
             print(f"  🟢 [UNFROZEN] {name} (Shape: {list(param.shape)})")
@@ -469,8 +506,32 @@ def main():
 
     def custom_configure_optimizers(self):
         trainable_params = [p for p in self.parameters() if p.requires_grad]
+        # 최대 학습률(Target LR) 설정
         optimizer = torch.optim.AdamW(trainable_params, lr=5e-5, weight_decay=1e-3)
-        return optimizer
+
+        # 🌟 허깅페이스의 최신 스케줄러 도입 (Warmup + Restarts) 🌟
+        from transformers import get_cosine_with_hard_restarts_schedule_with_warmup
+        
+        # 스케줄러 설정값
+        warmup_steps = 1000 
+        total_steps = 300000
+        num_cycles = 18         
+        
+        scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+            num_cycles=num_cycles
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1
+            }
+        }
 
     import types
     training_wrapper.configure_optimizers = types.MethodType(custom_configure_optimizers, training_wrapper)

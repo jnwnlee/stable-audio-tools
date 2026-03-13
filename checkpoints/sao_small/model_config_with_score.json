@@ -60,10 +60,11 @@
                     }
                 },
                 {
-                    "id": "score_bin",
-                    "type": "score_bin",
+                    "id": "continuous_score",
+                    "type": "continuous_score",
                     "config": {
-                        "num_bins": 11
+                        "output_dim": 768,
+                        "cond_dim": 1
                     }
                 }
             ],
@@ -75,8 +76,7 @@
                 "seconds_total"
             ],
             "global_cond_ids": [
-                "seconds_total",
-                "score_bin"
+                "continuous_score"
             ],
             "diffusion_objective": "rf_denoiser",
             "type": "dit",
@@ -120,42 +120,42 @@
                 {
                     "prompt": "drum breaks 174 BPM",
                     "seconds_total": 10,
-                    "score_bin": 10
+                    "continuous_score": 10.0
                 },
                 {
                     "prompt": "People talking in a crowded cafe",
                     "seconds_total": 10,
-                    "score_bin": 10
+                    "continuous_score": 10.0
                 },
                 {
                     "prompt": "A short, beautiful piano riff in C minor",
                     "seconds_total": 10,
-                    "score_bin": 10
+                    "continuous_score": 10.0
                 },
                 {
                     "prompt": "Tight Snare Drum",
                     "seconds_total": 10,
-                    "score_bin": 10
+                    "continuous_score": 10.0
                 },
                 {
                     "prompt": "A dog barking next to a waterfall",
                     "seconds_total": 10,
-                    "score_bin": 10
+                    "continuous_score": 10.0
                 },
                 {
                     "prompt": "Glitchy bass design",
                     "seconds_total": 10,
-                    "score_bin": 10
+                    "continuous_score": 10.0
                 },
                 {
                     "prompt": "Synth pluck arp with reverb and delay, 128 BPM",
                     "seconds_total": 10,
-                    "score_bin": 10
+                    "continuous_score": 10.0
                 },
                 {
                     "prompt": "Birds singing in the forest",
                     "seconds_total": 10,
-                    "score_bin": 10
+                    "continuous_score": 10.0
                 }
             ],
             "demo_cfg_scales": [
