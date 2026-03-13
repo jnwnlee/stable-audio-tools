@@ -18,6 +18,14 @@ from stable_audio_tools.training.reward_monitor import RewardMonitorCallback
 NULL_CONDITION_VALUE = -999.0
 DEFAULT_CFG_DROP_RATE = float(os.getenv("SA_CFG_DROP_RATE", "0.15"))
 MUSIC_RANKNET_ROOT = os.getenv("MUSIC_RANKNET_ROOT", "/home/yonghyun/music-ranknet")
+DEFAULT_UNFREEZE_PROFILE = os.getenv("SA_UNFREEZE_PROFILE", "hybrid")
+UNFREEZE_PROFILES = {
+    "hybrid": ["continuous_score", "score_bin", "to_global_embed", "adaLN", "input_add_adapter"],
+    "adaln": ["continuous_score", "score_bin", "adaLN"],
+    "adapter": ["continuous_score", "score_bin", "input_add_adapter"],
+    "global": ["continuous_score", "score_bin", "to_global_embed"],
+    "minimal": ["continuous_score", "score_bin"],
+}
 
 
 def ranknet_path(*parts: str) -> str:
@@ -104,11 +112,27 @@ def create_wrapped_dataloader(dataset_config, model_config, batch_size, num_work
     )
 
 
+def resolve_trainable_name_keys():
+    # Optional override for power users (comma-separated substrings)
+    custom_keys = os.getenv("SA_TRAINABLE_NAME_KEYS", "").strip()
+    if custom_keys:
+        keys = [k.strip() for k in custom_keys.split(",") if k.strip()]
+        if keys:
+            return "custom", keys
+
+    profile = DEFAULT_UNFREEZE_PROFILE.lower().strip()
+    if profile not in UNFREEZE_PROFILES:
+        print(f"[WARN] Unknown SA_UNFREEZE_PROFILE='{profile}', fallback to 'hybrid'")
+        profile = "hybrid"
+    return profile, UNFREEZE_PROFILES[profile]
+
+
 def unfreeze_finetune_params(model):
-    print("[*] Freezing backbone, unfreezing score-conditioning routes...")
+    profile, trainable_name_keys = resolve_trainable_name_keys()
+    print(f"[*] Freezing backbone, unfreezing score-conditioning routes (profile={profile})...")
     model.requires_grad_(False)
 
-    trainable_name_keys = ["continuous_score", "score_bin", "to_global_embed", "adaLN", "input_add_adapter"]
+    print(f"[*] Trainable name keys: {trainable_name_keys}")
     print("\n[*] --- List of unfrozen parameters ---")
     unfrozen_count = 0
     for name, param in model.named_parameters():
@@ -125,7 +149,9 @@ def attach_custom_optimizer(training_wrapper):
         if not trainable_params:
             raise RuntimeError("No trainable parameters found. Check freeze/unfreeze rules.")
 
-        optimizer = torch.optim.AdamW(trainable_params, lr=5e-5, weight_decay=1e-3)
+        lr = float(os.getenv("SA_LR", "5e-5"))
+        weight_decay = float(os.getenv("SA_WEIGHT_DECAY", "1e-3"))
+        optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
         from transformers import get_cosine_with_hard_restarts_schedule_with_warmup
 
         warmup_steps = int(os.getenv("SA_WARMUP_STEPS", "1000"))
@@ -176,15 +202,20 @@ def create_reward_callback(val_dl, train_dl, use_score_conditioning):
         "REWARD_THRESHOLDS_PATH",
         ranknet_path("data", "processed", "FMA_Scoring", "reward_thresholds.json"),
     )
+    val_num_samples = int(os.getenv("SA_VAL_NUM_SAMPLES", "100"))
+    val_gen_steps = int(os.getenv("SA_VAL_GEN_STEPS", "50"))
+    val_cfg_scale = float(os.getenv("SA_VAL_CFG_SCALE", "3.5"))
     return RewardMonitorCallback(
         reward_model_path=reward_ckpt_path,
         clap_ckpt_path=clap_ckpt_path,
         thresholds_path=thresholds_path,
         val_dl=val_dl if val_dl else train_dl,
-        num_samples=100,
+        num_samples=val_num_samples,
         use_score_conditioning=use_score_conditioning,
         music_ranknet_root=MUSIC_RANKNET_ROOT,
         null_condition_value=NULL_CONDITION_VALUE,
+        gen_steps=val_gen_steps,
+        cfg_scale=val_cfg_scale,
     )
 
 
@@ -225,7 +256,7 @@ def main():
     dataset_config = load_json(args.dataset_config)
     has_score_cond = any(
         cond.get("id") in {"score_bin", "continuous_score"}
-        for cond in model_config.get("conditioning", {}).get("configs", [])
+        for cond in model_config.get("model", {}).get("conditioning", {}).get("configs", [])
     )
 
     train_dl = create_wrapped_dataloader(
@@ -277,3 +308,19 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+"""
+PYTHONPATH=. python3 ./finetune.py \
+  --dataset-config ./configs/dataset_fma_scored.json \
+  --val-dataset-config ./configs/dataset_fma_scored.json \
+  --model-config ./checkpoints/sao_small/model_config_with_score.json \
+  --pretrained-ckpt-path ./checkpoints/sao_small/model.safetensors \
+  --name "sao_small_case3_$(date +%Y%m%d_%H%M%S)" \
+  --save-dir ./results/sao_small_case3 \
+  --batch-size 2 \
+  --accum-batches 4 \
+  --precision 16-mixed \
+  --checkpoint-every 1000 \
+  --val-every 1000
+"""

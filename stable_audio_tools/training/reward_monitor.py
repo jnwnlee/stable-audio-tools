@@ -1,6 +1,8 @@
 import json
 import os
 import sys
+import time
+from itertools import combinations
 
 import laion_clap
 import pytorch_lightning as pl
@@ -26,6 +28,8 @@ class RewardMonitorCallback(pl.Callback):
         use_score_conditioning=False,
         music_ranknet_root=None,
         null_condition_value=-999.0,
+        gen_steps=50,
+        cfg_scale=3.5,
     ):
         super().__init__()
         self.reward_model_path = reward_model_path
@@ -36,6 +40,8 @@ class RewardMonitorCallback(pl.Callback):
         self.use_score_conditioning = use_score_conditioning
         self.music_ranknet_root = music_ranknet_root
         self.null_condition_value = null_condition_value
+        self.gen_steps = int(gen_steps)
+        self.cfg_scale = float(cfg_scale)
 
         self.reward_model = None
         self.mert_processor = None
@@ -47,7 +53,6 @@ class RewardMonitorCallback(pl.Callback):
         device = pl_module.device
         print(f"[*] Setting up Reward Monitor on {device}...")
 
-        self.use_score_conditioning = True
         self.target_score_list = self._load_threshold_targets()
         if not self.target_score_list:
             print(f"!!! FATAL: Thresholds file NOT FOUND at {self.thresholds_path}")
@@ -142,10 +147,13 @@ class RewardMonitorCallback(pl.Callback):
 
         device = pl_module.device
         pl_module.eval()
+        val_start = time.perf_counter()
 
         target_scores_log, measured_scores_log = [], []
         bin_scores = {i: [] for i in range(11)}
         generated_count = 0
+        error_count = 0
+        audio_log_count = 0
         model_sr = getattr(pl_module, "sample_rate", 44100)
 
         with torch.no_grad():
@@ -159,9 +167,9 @@ class RewardMonitorCallback(pl.Callback):
                     if generated_count >= self.num_samples:
                         break
 
-                    m = metadata[i] if isinstance(metadata, (list, tuple)) else metadata
+                    m = self._metadata_item(metadata, i)
                     p_val = m.get("prompt", "A music song.")
-                    while isinstance(p_val, (list, tuple)):
+                    while isinstance(p_val, (list, tuple)) and len(p_val) > 0:
                         p_val = p_val[0]
                     clean_p = str(p_val)
                     clean_s = 10.0
@@ -178,8 +186,8 @@ class RewardMonitorCallback(pl.Callback):
                         gen_audio = pl_module.diffusion.generate(
                             conditioning=single_cond_input,
                             negative_conditioning=negative_cond_input,
-                            steps=50,
-                            cfg_scale=3.5,
+                            steps=self.gen_steps,
+                            cfg_scale=self.cfg_scale,
                             batch_size=1,
                             sample_size=int(model_sr * clean_s),
                         )
@@ -216,19 +224,40 @@ class RewardMonitorCallback(pl.Callback):
                                 },
                                 commit=False,
                             )
+                            audio_log_count += 1
 
                         print(f"[*] Generated Sample {generated_count} (Target: {target_val:.2f})")
                         generated_count += 1
                     except Exception as e:
                         print(f"!!! Error at sample {generated_count}: {e}")
+                        error_count += 1
                         generated_count += 1
+
+        if trainer.logger and isinstance(trainer.logger, pl.loggers.WandbLogger):
+            # Ensure pending commit=False audio logs are flushed once per validation run.
+            trainer.logger.experiment.log({}, commit=True)
+
+        val_elapsed_sec = time.perf_counter() - val_start
+        pl_module.log("val/reward_eval_time_sec", float(val_elapsed_sec), rank_zero_only=True)
+        pl_module.log("val/reward_generated_count", int(generated_count), rank_zero_only=True)
+        pl_module.log("val/reward_error_count", int(error_count), rank_zero_only=True)
+        pl_module.log("val/reward_audio_log_count", int(audio_log_count), rank_zero_only=True)
+        pl_module.log("val/reward_scored_count", int(len(target_scores_log)), rank_zero_only=True)
+        print(
+            f"[*] RewardMonitor summary: generated={generated_count}, "
+            f"scored={len(target_scores_log)}, errors={error_count}, "
+            f"audio_logged={audio_log_count}, time={val_elapsed_sec:.2f}s"
+        )
 
         if self.use_score_conditioning and target_scores_log:
             stacked = torch.stack((torch.tensor(target_scores_log), torch.tensor(measured_scores_log)))
             corr_matrix = torch.corrcoef(stacked)
             correlation = corr_matrix[0, 1].item() if not torch.isnan(corr_matrix[0, 1]) else 0.0
+            monotonicity = self._pairwise_monotonicity(target_scores_log, measured_scores_log)
             pl_module.log("val/reward_correlation", correlation, rank_zero_only=True)
+            pl_module.log("val/score_monotonicity", monotonicity, rank_zero_only=True)
             print(f"\n[*] Epoch {trainer.current_epoch} - Correlation: {correlation:.4f}")
+            print(f"[*] Epoch {trainer.current_epoch} - Monotonicity: {monotonicity:.4f}")
             print("-" * 50)
 
             for i in range(10):
@@ -239,3 +268,42 @@ class RewardMonitorCallback(pl.Callback):
                     pl_module.log(f"val/measured_score_top_{percentile}_percent", avg_bin_score, rank_zero_only=True)
                     print(f"  - Target Top {percentile}% (Val: {target_score:.2f}) -> Measured Avg: {avg_bin_score:.4f}")
             print("-" * 50)
+
+    @staticmethod
+    def _metadata_item(metadata, idx):
+        if isinstance(metadata, dict):
+            item = {}
+            for key, value in metadata.items():
+                if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] > idx:
+                    v = value[idx]
+                    item[key] = v.item() if torch.is_tensor(v) and v.ndim == 0 else v
+                elif isinstance(value, (list, tuple)) and len(value) > idx:
+                    item[key] = value[idx]
+                else:
+                    item[key] = value
+            return item
+        if isinstance(metadata, (list, tuple)) and len(metadata) > idx:
+            return metadata[idx]
+        return metadata
+
+    @staticmethod
+    def _pairwise_monotonicity(targets, measured):
+        """
+        Returns the fraction of pairwise orderings that agree between targets and measured scores.
+        Ties in targets are skipped.
+        """
+        if len(targets) < 2 or len(measured) < 2:
+            return 0.0
+
+        agree = 0
+        total = 0
+        for i, j in combinations(range(len(targets)), 2):
+            dt = targets[i] - targets[j]
+            if dt == 0:
+                continue
+            dm = measured[i] - measured[j]
+            total += 1
+            if dt * dm > 0:
+                agree += 1
+
+        return float(agree) / float(total) if total > 0 else 0.0

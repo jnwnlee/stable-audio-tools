@@ -132,6 +132,84 @@ python3 ./finetune.py \
   --val-every 1000
 ```
 
+One-command launcher (recommended):
+
+```bash
+./scripts/run_finetune_case3.sh
+```
+
+Show all available overrides:
+
+```bash
+./scripts/run_finetune_case3.sh --help
+```
+
+### Conditioning strategy options
+
+You can switch score-conditioning behavior without editing code by setting `SA_UNFREEZE_PROFILE`:
+
+- `hybrid` (default): unfreezes `continuous_score` + `to_global_embed` + `adaLN` + `input_add_adapter`
+- `adaln`: focuses on AdaLN modulation paths
+- `adapter`: focuses on additive adapter path (`input_add_adapter`)
+- `global`: focuses on global embedding route (`to_global_embed`)
+- `minimal`: only score-conditioning heads (most conservative)
+
+Example:
+
+```bash
+SA_UNFREEZE_PROFILE=adaln RUN_NAME=sao_adaln_exp1 ./scripts/run_finetune_case3.sh
+```
+
+By default, checkpoints are also grouped by profile under:
+`./results/sao_small_case3/<profile>/`
+
+Advanced custom override (comma-separated name substrings):
+
+```bash
+SA_TRAINABLE_NAME_KEYS="continuous_score,adaLN,input_add_adapter" ./scripts/run_finetune_case3.sh
+```
+
+### Suggested experiment matrix
+
+For score-conditioning research, a practical baseline matrix is:
+
+1. `minimal` (stability baseline)
+2. `adaln` (conditioning strength via modulation)
+3. `adapter` (conditioning strength via additive route)
+4. `hybrid` (best overall candidate in many settings)
+
+Keep all other hyperparameters fixed while comparing:
+- same prompts for validation
+- same random seed
+- same `cfg_scale` / diffusion steps
+- same data split
+
+Validation cost controls (no code change needed):
+
+```bash
+SA_VAL_NUM_SAMPLES=40 SA_VAL_GEN_STEPS=30 SA_VAL_CFG_SCALE=3.5 ./scripts/run_finetune_case3.sh
+```
+
+Recommended for quick smoke validation:
+- `SA_VAL_NUM_SAMPLES=20`
+- `SA_VAL_GEN_STEPS=20`
+
+The reward-monitor validation also logs operational metrics:
+- `val/reward_eval_time_sec`
+- `val/reward_generated_count`
+- `val/reward_scored_count`
+- `val/reward_error_count`
+- `val/reward_audio_log_count`
+- `val/score_monotonicity` (pairwise ranking consistency between target and measured scores)
+
+### Other high-value score-conditioning ideas
+
+If you want to push performance further, these are often effective:
+- **Two-stage training**: `minimal` warm-up, then continue with `hybrid`
+- **Curriculum on condition dropout**: start with lower `SA_CFG_DROP_RATE`, then increase
+- **Score normalization**: z-score or quantile normalization of `reward_score` before conditioning
+- **Monotonicity evaluation**: track correlation + pairwise monotonic ordering, not just average score
+
 Practical notes for researchers:
 - Keep training deterministic where possible: set `--seed` and log all env vars in your run metadata.
 - Verify trainable parameter subsets at startup (`finetune.py` prints all unfrozen tensors).
