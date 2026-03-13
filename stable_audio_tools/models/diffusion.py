@@ -620,6 +620,10 @@ class DiTWrapper(ConditionedDiffusionModel):
 
         assert batch_cfg, "batch_cfg must be True for DiTWrapper"
         #assert negative_input_concat_cond is None, "negative_input_concat_cond is not supported for DiTWrapper"
+        
+        # 🌟 [LatCHs Insight: Selective CFG] 🌟
+        if t.max().item() < 0.8:
+            cfg_scale = 1.0
 
         return self.model(
             x,

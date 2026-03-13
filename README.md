@@ -94,6 +94,128 @@ To continue a training run from a wrapped model checkpoint, you can pass in the 
 
 To start a fresh training run using a pre-trained unwrapped model, you can pass in the unwrapped checkpoint to `train.py` with the `--pretrained-ckpt-path` flag.
 
+## Research Fine-Tuning (Continuous Score Conditioning)
+
+If you are running steerability experiments with continuous reward scores, use `finetune.py` with:
+- a model config that defines `continuous_score` conditioning
+- an audio dataset where each audio file has a sidecar JSON containing `prompt`/`text` and `reward_score`
+
+Recommended environment variables for reproducible research runs:
+
+```bash
+export CUDA_VISIBLE_DEVICES=8,9
+export MUSIC_RANKNET_ROOT=/path/to/music-ranknet
+export REWARD_MODEL_CKPT=$MUSIC_RANKNET_ROOT/checkpoints/ultimate_train_all(brainmusic).pt
+export CLAP_MODEL_CKPT=$MUSIC_RANKNET_ROOT/checkpoints/music_audioset_epoch_15_esc_90.14.pt
+export REWARD_THRESHOLDS_PATH=$MUSIC_RANKNET_ROOT/data/processed/FMA_Scoring/reward_thresholds.json
+
+# Optional scheduler overrides
+export SA_WARMUP_STEPS=1000
+export SA_TOTAL_STEPS=300000
+export SA_NUM_CYCLES=18
+```
+
+Example launch command:
+
+```bash
+python3 ./finetune.py \
+  --dataset-config ./configs/dataset_fma_scored.json \
+  --val-dataset-config ./configs/dataset_fma_scored.json \
+  --model-config ./checkpoints/sao_small/model_config_with_score.json \
+  --pretrained-ckpt-path ./checkpoints/sao_small/model.safetensors \
+  --name "sao_small_case3_run01" \
+  --save-dir ./results/sao_small_case3 \
+  --batch-size 2 \
+  --accum-batches 4 \
+  --precision 16-mixed \
+  --checkpoint-every 1000 \
+  --val-every 1000
+```
+
+One-command launcher (recommended):
+
+```bash
+./scripts/run_finetune_case3.sh
+```
+
+Show all available overrides:
+
+```bash
+./scripts/run_finetune_case3.sh --help
+```
+
+### Conditioning strategy options
+
+You can switch score-conditioning behavior without editing code by setting `SA_UNFREEZE_PROFILE`:
+
+- `hybrid` (default): unfreezes `continuous_score` + `to_global_embed` + `adaLN` + `input_add_adapter`
+- `adaln`: focuses on AdaLN modulation paths
+- `adapter`: focuses on additive adapter path (`input_add_adapter`)
+- `global`: focuses on global embedding route (`to_global_embed`)
+- `minimal`: only score-conditioning heads (most conservative)
+
+Example:
+
+```bash
+SA_UNFREEZE_PROFILE=adaln RUN_NAME=sao_adaln_exp1 ./scripts/run_finetune_case3.sh
+```
+
+By default, checkpoints are also grouped by profile under:
+`./results/sao_small_case3/<profile>/`
+
+Advanced custom override (comma-separated name substrings):
+
+```bash
+SA_TRAINABLE_NAME_KEYS="continuous_score,adaLN,input_add_adapter" ./scripts/run_finetune_case3.sh
+```
+
+### Suggested experiment matrix
+
+For score-conditioning research, a practical baseline matrix is:
+
+1. `minimal` (stability baseline)
+2. `adaln` (conditioning strength via modulation)
+3. `adapter` (conditioning strength via additive route)
+4. `hybrid` (best overall candidate in many settings)
+
+Keep all other hyperparameters fixed while comparing:
+- same prompts for validation
+- same random seed
+- same `cfg_scale` / diffusion steps
+- same data split
+
+Validation cost controls (no code change needed):
+
+```bash
+SA_VAL_NUM_SAMPLES=40 SA_VAL_GEN_STEPS=30 SA_VAL_CFG_SCALE=3.5 ./scripts/run_finetune_case3.sh
+```
+
+Recommended for quick smoke validation:
+- `SA_VAL_NUM_SAMPLES=20`
+- `SA_VAL_GEN_STEPS=20`
+
+The reward-monitor validation also logs operational metrics:
+- `val/reward_eval_time_sec`
+- `val/reward_generated_count`
+- `val/reward_scored_count`
+- `val/reward_error_count`
+- `val/reward_audio_log_count`
+- `val/score_monotonicity` (pairwise ranking consistency between target and measured scores)
+
+### Other high-value score-conditioning ideas
+
+If you want to push performance further, these are often effective:
+- **Two-stage training**: `minimal` warm-up, then continue with `hybrid`
+- **Curriculum on condition dropout**: start with lower `SA_CFG_DROP_RATE`, then increase
+- **Score normalization**: z-score or quantile normalization of `reward_score` before conditioning
+- **Monotonicity evaluation**: track correlation + pairwise monotonic ordering, not just average score
+
+Practical notes for researchers:
+- Keep training deterministic where possible: set `--seed` and log all env vars in your run metadata.
+- Verify trainable parameter subsets at startup (`finetune.py` prints all unfrozen tensors).
+- Use short smoke runs first (few hundred steps) before long runs to validate dataloading, conditioning keys, and logging.
+- Keep validation prompts fixed across experiments for fair steerability comparisons.
+
 ## Additional training flags
 
 Additional optional flags for `train.py` include:

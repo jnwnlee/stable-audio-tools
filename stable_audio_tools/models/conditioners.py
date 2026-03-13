@@ -797,6 +797,10 @@ def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.An
             conditioners[id] = ListConditioner(**conditioner_config)
         elif conditioner_type == "score_bin":
             conditioners[id] = ScoreBinConditioner(**conditioner_config)
+        elif conditioner_type == 'continuous_score':
+            conditioners[id] = ContinuousScoreConditioner(
+                output_dim=conditioner_config.get('output_dim', 768),
+                cond_dim=conditioner_config.get('cond_dim', 1))
         elif conditioner_type == "phoneme":
             conditioners[id] = PhonemeConditioner(**conditioner_config)
         elif conditioner_type == "lut":
@@ -891,3 +895,38 @@ class ScoreBinConditioner(Conditioner):
 
         # 4. Standardized Return: [embeddings, attention_mask]
         return [emb, torch.ones(emb.shape[0], 1).to(device)]
+    
+    
+class ContinuousScoreConditioner(nn.Module):
+    """
+    Reflects the philosophy of the LatCHs paper:
+    Instead of hard-labeled bins, this module accepts continuous 1D scalar scores 
+    (logits or raw scores) and projects them directly into the conditioning 
+    vector space via a Linear layer.
+    """
+    def __init__(self, output_dim, cond_dim=1):
+        super().__init__()
+        self.output_dim = output_dim
+        self.mapper = nn.Linear(cond_dim, output_dim)
+
+    def forward(self, x, device):
+        if isinstance(x, list):
+            x = torch.cat([torch.as_tensor(item, dtype=torch.float32, device=device).view(-1) for item in x])
+        else:
+            x = torch.as_tensor(x, dtype=torch.float32, device=device).view(-1)
+            
+        # 2. 모델이 요구하는 완벽한 (Batch, 1) 세로 형태로 강제 정렬합니다.
+        x = x.view(-1, 1)
+        
+        # 3. Linear 계층을 통과시킵니다.
+        embeds = self.mapper(x)
+        embeds = embeds.unsqueeze(-1)
+        
+        # 4. CFG Null condition handling (-999.0)
+        null_idx = (x.squeeze(-1) == -999.0)
+        if null_idx.any():
+            embeds[null_idx] = 0.0
+
+        # Return embeddings and a fully active mask on the correct device
+        mask = torch.ones(embeds.shape[0], 1, device=device)
+        return embeds, mask
