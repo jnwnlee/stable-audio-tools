@@ -94,6 +94,50 @@ To continue a training run from a wrapped model checkpoint, you can pass in the 
 
 To start a fresh training run using a pre-trained unwrapped model, you can pass in the unwrapped checkpoint to `train.py` with the `--pretrained-ckpt-path` flag.
 
+## Research Fine-Tuning (Continuous Score Conditioning)
+
+If you are running steerability experiments with continuous reward scores, use `finetune.py` with:
+- a model config that defines `continuous_score` conditioning
+- an audio dataset where each audio file has a sidecar JSON containing `prompt`/`text` and `reward_score`
+
+Recommended environment variables for reproducible research runs:
+
+```bash
+export CUDA_VISIBLE_DEVICES=8,9
+export MUSIC_RANKNET_ROOT=/path/to/music-ranknet
+export REWARD_MODEL_CKPT=$MUSIC_RANKNET_ROOT/checkpoints/ultimate_train_all(brainmusic).pt
+export CLAP_MODEL_CKPT=$MUSIC_RANKNET_ROOT/checkpoints/music_audioset_epoch_15_esc_90.14.pt
+export REWARD_THRESHOLDS_PATH=$MUSIC_RANKNET_ROOT/data/processed/FMA_Scoring/reward_thresholds.json
+
+# Optional scheduler overrides
+export SA_WARMUP_STEPS=1000
+export SA_TOTAL_STEPS=300000
+export SA_NUM_CYCLES=18
+```
+
+Example launch command:
+
+```bash
+python3 ./finetune.py \
+  --dataset-config ./configs/dataset_fma_scored.json \
+  --val-dataset-config ./configs/dataset_fma_scored.json \
+  --model-config ./checkpoints/sao_small/model_config_with_score.json \
+  --pretrained-ckpt-path ./checkpoints/sao_small/model.safetensors \
+  --name "sao_small_case3_run01" \
+  --save-dir ./results/sao_small_case3 \
+  --batch-size 2 \
+  --accum-batches 4 \
+  --precision 16-mixed \
+  --checkpoint-every 1000 \
+  --val-every 1000
+```
+
+Practical notes for researchers:
+- Keep training deterministic where possible: set `--seed` and log all env vars in your run metadata.
+- Verify trainable parameter subsets at startup (`finetune.py` prints all unfrozen tensors).
+- Use short smoke runs first (few hundred steps) before long runs to validate dataloading, conditioning keys, and logging.
+- Keep validation prompts fixed across experiments for fair steerability comparisons.
+
 ## Additional training flags
 
 Additional optional flags for `train.py` include:
